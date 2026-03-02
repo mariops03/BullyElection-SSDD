@@ -1,6 +1,6 @@
-# Bully Election Algorithm
+# Distributed Bully
 
-Distributed implementation of the [Bully Election Algorithm](https://en.wikipedia.org/wiki/Bully_algorithm) across multiple servers. Processes communicate via REST APIs, elect a coordinator through the Bully protocol, and automatically trigger new elections when the coordinator fails. The system deploys as a WAR on Apache Tomcat instances and includes a CLI manager to control processes in real time.
+Distributed implementation of the [Bully Election Algorithm](https://en.wikipedia.org/wiki/Bully_algorithm) across multiple servers. Processes are distributed round-robin across Tomcat instances and communicate through REST APIs with a server-mediated fan-out optimization — election messages are sent once per server, and each server internally relays them to all relevant local processes. Includes a CLI manager to control processes in real time.
 
 Built as a university project for the **Sistemas Distribuidos (SSDD)** course.
 
@@ -8,26 +8,25 @@ Built as a university project for the **Sistemas Distribuidos (SSDD)** course.
 
 The [Bully Algorithm](https://en.wikipedia.org/wiki/Bully_algorithm) (Garcia-Molina, 1982) is a leader election protocol for distributed systems. The process with the highest ID always wins the election — hence "bully."
 
-**Election flow:**
+### Election flow
 
-1. A process detects the coordinator is unresponsive (via periodic `computar` health checks)
-2. It sends an **ELECTION** message to all processes with higher IDs
-3. If any higher process responds with **OK**, the initiator backs off and waits
-4. The highest responding process repeats the election upward
-5. If no one responds, the initiator declares itself **COORDINATOR** and broadcasts to all
+1. Each running process periodically pings the coordinator via a `computar` health check. If the coordinator is unreachable (REST call fails) **or** responds with a negative value (it's stopped), a new election is triggered
+2. The initiator groups all higher-ID processes **by server** and sends a single **ELECTION** message per server (not per process). The server-side `Servicio` receives the message and fans it out to all local running processes with ID > initiator
+3. Each process that receives the election sends **OK** back to the initiator and starts its own election (if not already in one)
+4. The initiator waits for a timeout. If it receives OK, it backs off and waits for a **COORDINATOR** announcement. If no coordinator arrives within a second timeout, it restarts the election
+5. If no one responds with OK, the initiator declares itself **COORDINATOR** and broadcasts to all servers (one message per server, fan-out on each)
 
-**Coordinator monitoring:**
-
-Each running process periodically pings the current coordinator. If the coordinator doesn't respond (crashed or stopped), a new election is triggered automatically.
+Additionally, when a process is started (transitions from `stopped` to `running`), it immediately triggers an election to discover or establish the current coordinator. The coordinator itself skips pinging — if `idCoord == id`, the health check returns immediately.
 
 ```
-Process 1 ──► Process 4 (coordinator)   ✗ no response
+Process 1 ──► ping Process 4 (coordinator)   ✗ no response / returns -1
          └──► triggers ELECTION
-              Process 2 ──► OK to 1
-              Process 3 ──► OK to 1
-              Process 3 ──► ELECTION to higher
-              (no response)
-              Process 3 ──► COORDINATOR broadcast
+              sends 1 msg per server (server fan-out to local processes)
+              ┌─ Process 2 ──► OK to 1, starts own election
+              └─ Process 3 ──► OK to 1, starts own election
+              Process 3 ──► ELECTION to higher IDs (none respond)
+              Process 3 ──► COORDINATOR broadcast (1 msg/server)
+              All processes set coordinator = 3
 ```
 
 ## Architecture
@@ -57,14 +56,14 @@ The system has three main components distributed across multiple machines:
               (election / ok / coordinator)
 ```
 
-Processes are distributed across servers in **round-robin** fashion. All inter-process communication happens through async REST calls (Jersey client), meaning processes on different physical machines communicate seamlessly.
+Processes are distributed across servers in **round-robin** fashion. Inter-process communication is **server-mediated**: instead of sending N messages to N individual processes, the system sends one REST call per server. The `Servicio` singleton on each server then relays the message to all relevant local processes. This reduces network overhead from O(n) to O(servers).
 
 ### Components
 
 | Component | File | Role |
 |-----------|------|------|
-| **Servicio** | `src/services/Servicio.java` | JAX-RS REST service (Singleton). Exposes endpoints for process lifecycle and election protocol. Deployed as WAR on each Tomcat instance |
-| **Proceso** | `src/cliente/Proceso.java` | Thread implementing the Bully algorithm. Handles elections, coordinator monitoring, and state transitions using monitors and semaphores |
+| **Servicio** | `src/services/Servicio.java` | JAX-RS REST service (Singleton). Exposes endpoints for process lifecycle and election protocol. Receives one message per server and fans out to relevant local processes |
+| **Proceso** | `src/cliente/Proceso.java` | Thread implementing the Bully algorithm. Handles elections, coordinator monitoring with dual failure detection (unreachable + negative response), and state transitions using monitors and semaphores |
 | **Gestor** | `src/cliente/Gestor.java` | CLI client that creates processes across servers, distributes them round-robin, and provides interactive management (start/stop/status) |
 
 ### REST Endpoints
@@ -72,14 +71,14 @@ Processes are distributed across servers in **round-robin** fashion. All inter-p
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/rest/servicio/start` | GET | Create a new process on the server |
-| `/rest/servicio/arranque?id=N` | GET | Start (wake up) process N |
+| `/rest/servicio/arranque?id=N` | GET | Start (wake up) process N — triggers immediate election |
 | `/rest/servicio/parada?id=N` | GET | Stop process N |
 | `/rest/servicio/estado` | GET | Get status of all processes on this server |
 | `/rest/servicio/resultado` | GET | Get election results from this server |
-| `/rest/servicio/eleccion?fromId=N` | GET | Receive an election message from process N |
-| `/rest/servicio/recibirOk?fromId=N` | GET | Receive an OK response |
-| `/rest/servicio/coordinador?id=N` | GET | Receive coordinator announcement |
-| `/rest/servicio/computar?id=N` | GET | Health check — is process N alive? |
+| `/rest/servicio/eleccion?fromId=N` | GET | Receive election — fans out to all local processes with ID > N |
+| `/rest/servicio/recibirOk?fromId=N` | GET | Deliver OK response to process N |
+| `/rest/servicio/coordinador?id=N` | GET | Receive coordinator announcement — fans out to all local running processes with ID < N |
+| `/rest/servicio/computar?id=N` | GET | Health check — returns 1 if alive, -1 if stopped |
 
 ### Process States
 
@@ -89,10 +88,12 @@ Each process tracks two independent state machines:
 
 **Election state:** `nada` → `eleccion_activa` → `eleccion_pasiva` → `acuerdo`
 
-- **nada** — No election in progress
-- **eleccion_activa** — This process initiated an election
-- **eleccion_pasiva** — Received OK from a higher process, waiting for coordinator
-- **acuerdo** — Coordinator established, normal operation
+- **nada** — No election in progress (also set when process is stopped)
+- **eleccion_activa** — This process initiated an election, waiting for responses
+- **eleccion_pasiva** — Received OK from a higher process, backed off, waiting for coordinator announcement
+- **acuerdo** — Coordinator established, normal operation (periodic health checks)
+
+Transition from `eleccion_pasiva`: if no COORDINATOR arrives within the timeout, the process restarts the election instead of staying passive indefinitely.
 
 ## Deployment
 
@@ -115,7 +116,7 @@ The included `run.sh` script automates the full deployment pipeline:
 ```
 
 - **Line 1:** Comma-separated list of server addresses (IP:port)
-- **Line 2:** Total number of processes to distribute across all servers
+- **Line 2:** Total number of processes to distribute across all servers (round-robin)
 
 ### Running it
 
@@ -146,10 +147,11 @@ The Gestor CLI provides these commands:
 
 The implementation uses several synchronization mechanisms:
 
-- **Monitors** (`synchronized` + `wait`/`notify`) — Process lifecycle: stopped processes wait on a monitor and are woken up on `arrancar()`
-- **Semaphores** — Log file access: a shared `Semaphore` ensures thread-safe logging across all processes
-- **Election monitor** — A dedicated monitor for election timeouts: processes `wait(timeout)` for OK/coordinator messages and are notified when they arrive
-- **Async REST** — All inter-process communication uses Jersey's `InvocationCallback` for non-blocking requests
+- **Process monitor** (`synchronized` + `wait`/`notify`) — Stopped processes block on `monitor.wait()` and are woken up by `arrancar()` via `monitor.notify()`, immediately triggering an election
+- **Election monitor** — A dedicated monitor for election timeouts: processes call `monitorEleccion.wait(REQUEST_TIMEOUT_MS)` and are notified when OK or COORDINATOR messages arrive via `monitorEleccion.notify()`
+- **Log semaphore** — A shared `Semaphore` ensures thread-safe file logging across all processes writing to the same log file
+- **Election guard** (`estaEnEleccion`) — Boolean flag preventing re-entrant elections when a process is already participating in one
+- **Async REST** — All inter-process communication uses Jersey's `InvocationCallback` for non-blocking requests, with failure callbacks that automatically trigger new elections
 
 ## Tech stack
 
